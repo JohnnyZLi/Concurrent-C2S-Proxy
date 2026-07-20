@@ -1,12 +1,20 @@
 name: ci
+
 on:
   push:
   pull_request:
+
+permissions:
+  contents: read
+
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y libssl-dev
-      - run: make
-      - run: make test
+      - name: Check out repository
+        uses: actions/checkout@v5
+      - name: Install OpenSSL development files
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libssl-dev
+      - name: Build and test
+        run: make clean && make test
