@@ -8,6 +8,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -18,7 +19,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
-#include <fstream>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -97,14 +97,43 @@ private:
     std::uint64_t next_id_{1};
 };
 
+bool write_all_file(int fd, const char* data, std::size_t size) {
+    std::size_t offset = 0;
+    while (offset < size) {
+        const ssize_t count = ::write(fd, data + offset, size - offset);
+        if (count < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        offset += static_cast<std::size_t>(count);
+    }
+    return true;
+}
+
 class AccessLogger {
 public:
     explicit AccessLogger(std::string path) : path_(std::move(path)) {}
+    ~AccessLogger() {
+        if (fd_ >= 0) {
+            ::close(fd_);
+        }
+    }
+    AccessLogger(const AccessLogger&) = delete;
+    AccessLogger& operator=(const AccessLogger&) = delete;
 
     bool verify(std::string& error) {
-        std::ofstream output(path_, std::ios::app);
-        if (!output) {
-            error = "cannot open access log: " + path_;
+        fd_ = ::open(path_.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+        if (fd_ < 0) {
+            error = "cannot open access log: " + path_ + ": " + std::strerror(errno);
+            return false;
+        }
+        struct stat metadata{};
+        if (::fstat(fd_, &metadata) != 0 || !S_ISREG(metadata.st_mode)) {
+            error = "access log must be a regular file: " + path_;
+            ::close(fd_);
+            fd_ = -1;
             return false;
         }
         return true;
@@ -112,18 +141,19 @@ public:
 
     void write(const std::string& client_ip, const std::string& request_line,
                int status, std::size_t response_size) {
+        std::ostringstream line;
+        line << c2s::rfc3339_now() << ' ' << client_ip << " \"" << request_line
+             << "\" " << status << ' ' << response_size << '\n';
+        const std::string entry = line.str();
         std::lock_guard lock(mutex_);
-        std::ofstream output(path_, std::ios::app);
-        if (!output) {
+        if (fd_ < 0 || !write_all_file(fd_, entry.data(), entry.size())) {
             std::cerr << "Cannot append to access log " << path_ << '\n';
-            return;
         }
-        output << c2s::rfc3339_now() << ' ' << client_ip << " \"" << request_line
-               << "\" " << status << ' ' << response_size << '\n';
     }
 
 private:
     std::string path_;
+    int fd_{-1};
     std::mutex mutex_;
 };
 
@@ -145,13 +175,26 @@ bool parse_arguments(int argc, char** argv, std::string& port, std::string& acl_
     }
     for (int index = 1; index < argc; index += 2) {
         const std::string option = argv[index];
-        const std::string value = argv[index + 1];
+        const char* raw_value = argv[index + 1];
+        if (raw_value == nullptr || *raw_value == '\0') {
+            return false;
+        }
         if (option == "-p") {
-            port = value;
+            port = raw_value;
         } else if (option == "-a") {
-            acl_path = value;
+            if (std::strstr(raw_value, "..") != nullptr ||
+                std::strchr(raw_value, '/') != nullptr ||
+                std::strchr(raw_value, '\\') != nullptr) {
+                return false;
+            }
+            acl_path = raw_value;
         } else if (option == "-l") {
-            log_path = value;
+            if (std::strstr(raw_value, "..") != nullptr ||
+                std::strchr(raw_value, '/') != nullptr ||
+                std::strchr(raw_value, '\\') != nullptr) {
+                return false;
+            }
+            log_path = raw_value;
         } else {
             return false;
         }
@@ -607,7 +650,8 @@ int main(int argc, char** argv) {
     std::string acl_path;
     std::string log_path;
     if (!parse_arguments(argc, argv, port, acl_path, log_path)) {
-        std::cerr << "Usage: myproxy -p listen_port -a forbidden_sites_file_path -l access_log_file_path\n";
+        std::cerr << "Usage: myproxy -p listen_port -a forbidden_sites_filename -l access_log_filename\n"
+                  << "ACL and log names must be single files in the current working directory.\n";
         return 2;
     }
 
