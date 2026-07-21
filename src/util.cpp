@@ -1,4 +1,7 @@
+#define C2S_USE_SYSTEM_OPEN
 #include "util.hpp"
+
+#include <dirent.h>
 
 #include <cerrno>
 #include <chrono>
@@ -11,6 +14,61 @@
 #include <unistd.h>
 
 namespace c2s {
+
+int open_runtime_file(const char* requested_name, int flags, mode_t mode) {
+    if (requested_name == nullptr || *requested_name == '\0' ||
+        std::strcmp(requested_name, ".") == 0 || std::strcmp(requested_name, "..") == 0 ||
+        std::strchr(requested_name, '/') != nullptr ||
+        std::strchr(requested_name, '\\') != nullptr) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    const int directory_fd = ::open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory_fd < 0) {
+        return -1;
+    }
+
+    DIR* directory = ::fdopendir(directory_fd);
+    if (directory == nullptr) {
+        const int saved_errno = errno;
+        ::close(directory_fd);
+        errno = saved_errno;
+        return -1;
+    }
+
+    int result = -1;
+    int saved_errno = 0;
+    bool matched = false;
+    errno = 0;
+    while (dirent* entry = ::readdir(directory)) {
+        if (std::strcmp(entry->d_name, requested_name) != 0) {
+            continue;
+        }
+        matched = true;
+        const int safe_flags = (flags & ~O_CREAT) | O_CLOEXEC | O_NOFOLLOW;
+        result = ::openat(dirfd(directory), entry->d_name, safe_flags, mode);
+        saved_errno = errno;
+        break;
+    }
+
+    if (!matched && errno != 0) {
+        saved_errno = errno;
+    } else if (!matched && (flags & O_CREAT) != 0 &&
+               std::strcmp(requested_name, "access.log") == 0) {
+        result = ::openat(dirfd(directory), "access.log",
+                          flags | O_CLOEXEC | O_NOFOLLOW, mode);
+        saved_errno = errno;
+    } else if (!matched) {
+        saved_errno = ENOENT;
+    }
+
+    ::closedir(directory);
+    if (result < 0) {
+        errno = saved_errno;
+    }
+    return result;
+}
 
 std::string rfc3339_now() {
     using namespace std::chrono;
