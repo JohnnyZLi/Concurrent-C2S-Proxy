@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - .github/workflows/apply-path-hardening.yml
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -22,420 +23,337 @@ jobs:
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libssl-dev
 
-      - name: Harden runtime file handling
+      - name: Apply hardened file handling
         shell: bash
         run: |
-          python3 <<'PY'
-          from pathlib import Path
-
-          def replace_once(path: Path, old: str, new: str) -> None:
-              text = path.read_text(encoding="utf-8")
-              if text.count(old) != 1:
-                  raise SystemExit(f"expected one match in {path}, found {text.count(old)}")
-              path.write_text(text.replace(old, new), encoding="utf-8")
-
-          proxy = Path("src/proxy.cpp")
-          replace_once(
-              proxy,
-              "#include <sys/socket.h>\n#include <unistd.h>\n",
-              "#include <sys/socket.h>\n#include <sys/stat.h>\n#include <unistd.h>\n",
-          )
-          replace_once(proxy, "#include <fstream>\n", "")
-
-          replace_once(
-              proxy,
-              '''class AccessLogger {
-          public:
-              explicit AccessLogger(std::string path) : path_(std::move(path)) {}
-
-              bool verify(std::string& error) {
-                  std::ofstream output(path_, std::ios::app);
-                  if (!output) {
-                      error = "cannot open access log: " + path_;
-                      return false;
-                  }
-                  return true;
-              }
-
-              void write(const std::string& client_ip, const std::string& request_line,
-                         int status, std::size_t response_size) {
-                  std::lock_guard lock(mutex_);
-                  std::ofstream output(path_, std::ios::app);
-                  if (!output) {
-                      std::cerr << "Cannot append to access log " << path_ << '\\n';
-                      return;
-                  }
-                  output << c2s::rfc3339_now() << ' ' << client_ip << " \\\"" << request_line
-                         << "\\\" " << status << ' ' << response_size << '\\n';
-              }
-
-          private:
-              std::string path_;
-              std::mutex mutex_;
-          };
-          ''',
-              '''bool write_all_file(int fd, const char* data, std::size_t size) {
-              std::size_t offset = 0;
-              while (offset < size) {
-                  const ssize_t count = ::write(fd, data + offset, size - offset);
-                  if (count < 0) {
-                      if (errno == EINTR) {
-                          continue;
-                      }
-                      return false;
-                  }
-                  offset += static_cast<std::size_t>(count);
-              }
-              return true;
-          }
-
-          class AccessLogger {
-          public:
-              explicit AccessLogger(std::string path) : path_(std::move(path)) {}
-              ~AccessLogger() {
-                  if (fd_ >= 0) {
-                      ::close(fd_);
-                  }
-              }
-              AccessLogger(const AccessLogger&) = delete;
-              AccessLogger& operator=(const AccessLogger&) = delete;
-
-              bool verify(std::string& error) {
-                  fd_ = ::open(path_.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
-                  if (fd_ < 0) {
-                      error = "cannot open access log: " + path_ + ": " + std::strerror(errno);
-                      return false;
-                  }
-                  struct stat metadata{};
-                  if (::fstat(fd_, &metadata) != 0 || !S_ISREG(metadata.st_mode)) {
-                      error = "access log must be a regular file: " + path_;
-                      ::close(fd_);
-                      fd_ = -1;
-                      return false;
-                  }
-                  return true;
-              }
-
-              void write(const std::string& client_ip, const std::string& request_line,
-                         int status, std::size_t response_size) {
-                  std::ostringstream line;
-                  line << c2s::rfc3339_now() << ' ' << client_ip << " \\\"" << request_line
-                       << "\\\" " << status << ' ' << response_size << '\\n';
-                  const std::string entry = line.str();
-                  std::lock_guard lock(mutex_);
-                  if (fd_ < 0 || !write_all_file(fd_, entry.data(), entry.size())) {
-                      std::cerr << "Cannot append to access log " << path_ << '\\n';
-                  }
-              }
-
-          private:
-              std::string path_;
-              int fd_{-1};
-              std::mutex mutex_;
-          };
-          ''',
-          )
-
-          replace_once(
-              proxy,
-              '''bool parse_arguments(int argc, char** argv, std::string& port, std::string& acl_path,
-                               std::string& log_path) {
-              if (argc != 7) {
-                  return false;
-              }
-              for (int index = 1; index < argc; index += 2) {
-                  const std::string option = argv[index];
-                  const std::string value = argv[index + 1];
-                  if (option == "-p") {
-                      port = value;
-                  } else if (option == "-a") {
-                      acl_path = value;
-                  } else if (option == "-l") {
-                      log_path = value;
-                  } else {
-                      return false;
-                  }
-              }
-              if (port.empty() || acl_path.empty() || log_path.empty()) {
-                  return false;
-              }
-              char* end = nullptr;
-              errno = 0;
-              const long parsed = std::strtol(port.c_str(), &end, 10);
-              return errno == 0 && end != port.c_str() && *end == '\\0' && parsed > 0 && parsed <= 65535;
-          }
-          ''',
-              '''bool parse_arguments(int argc, char** argv, std::string& port, std::string& acl_path,
-                               std::string& log_path) {
-              if (argc != 7) {
-                  return false;
-              }
-              for (int index = 1; index < argc; index += 2) {
-                  const std::string option = argv[index];
-                  const char* raw_value = argv[index + 1];
-                  if (raw_value == nullptr || *raw_value == '\\0') {
-                      return false;
-                  }
-                  if (option == "-p") {
-                      port = raw_value;
-                  } else if (option == "-a") {
-                      if (std::strstr(raw_value, "..") != nullptr ||
-                          std::strchr(raw_value, '/') != nullptr ||
-                          std::strchr(raw_value, '\\\\') != nullptr) {
-                          return false;
-                      }
-                      acl_path = raw_value;
-                  } else if (option == "-l") {
-                      if (std::strstr(raw_value, "..") != nullptr ||
-                          std::strchr(raw_value, '/') != nullptr ||
-                          std::strchr(raw_value, '\\\\') != nullptr) {
-                          return false;
-                      }
-                      log_path = raw_value;
-                  } else {
-                      return false;
-                  }
-              }
-              if (port.empty() || acl_path.empty() || log_path.empty()) {
-                  return false;
-              }
-              char* end = nullptr;
-              errno = 0;
-              const long parsed = std::strtol(port.c_str(), &end, 10);
-              return errno == 0 && end != port.c_str() && *end == '\\0' && parsed > 0 && parsed <= 65535;
-          }
-          ''',
-          )
-
-          replace_once(
-              proxy,
-              '        std::cerr << "Usage: myproxy -p listen_port -a forbidden_sites_file_path -l access_log_file_path\\n";\n',
-              '        std::cerr << "Usage: myproxy -p listen_port -a forbidden_sites_filename -l access_log_filename\\n"\n'
-              '                  << "ACL and log names must be single files in the current working directory.\\n";\n',
-          )
-
-          Path("src/acl.cpp").write_text(r'''#include "acl.hpp"
-          #include "util.hpp"
-
-          #include <arpa/inet.h>
-          #include <fcntl.h>
-          #include <sys/stat.h>
-          #include <unistd.h>
-
-          #include <cerrno>
-          #include <cstdint>
-          #include <cstring>
-          #include <mutex>
-          #include <sstream>
-
-          namespace c2s {
-
-          bool AccessControlList::load(const std::string& path, std::string& error) {
-              const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-              if (fd < 0) {
-                  error = "cannot open forbidden-sites file: " + path + ": " + std::strerror(errno);
-                  return false;
-              }
-
-              struct stat metadata{};
-              if (::fstat(fd, &metadata) != 0 || !S_ISREG(metadata.st_mode)) {
-                  error = "forbidden-sites file must be a regular file: " + path;
-                  ::close(fd);
-                  return false;
-              }
-
-              constexpr std::size_t kMaximumAclBytes = 1024U * 1024U;
-              std::string contents;
-              if (metadata.st_size > 0) {
-                  const auto size = static_cast<std::uintmax_t>(metadata.st_size);
-                  if (size > kMaximumAclBytes) {
-                      error = "forbidden-sites file exceeds 1 MiB";
-                      ::close(fd);
-                      return false;
-                  }
-                  contents.reserve(static_cast<std::size_t>(size));
-              }
-
-              char buffer[8192];
-              while (true) {
-                  const ssize_t count = ::read(fd, buffer, sizeof(buffer));
-                  if (count == 0) {
-                      break;
-                  }
-                  if (count < 0) {
-                      if (errno == EINTR) {
-                          continue;
-                      }
-                      error = "cannot read forbidden-sites file: " + path + ": " + std::strerror(errno);
-                      ::close(fd);
-                      return false;
-                  }
-                  const auto amount = static_cast<std::size_t>(count);
-                  if (contents.size() > kMaximumAclBytes - amount) {
-                      error = "forbidden-sites file exceeds 1 MiB";
-                      ::close(fd);
-                      return false;
-                  }
-                  contents.append(buffer, amount);
-              }
-              ::close(fd);
-
-              std::unordered_set<std::string> replacement;
-              std::istringstream input(contents);
-              std::string line;
-              while (std::getline(input, line)) {
-                  const auto comment = line.find('#');
-                  if (comment != std::string::npos) {
-                      line.erase(comment);
-                  }
-                  line = lower_copy(trim_copy(line));
-                  while (!line.empty() && line.back() == '.') {
-                      line.pop_back();
-                  }
-                  if (line.empty()) {
-                      continue;
-                  }
-                  if (replacement.size() >= 1000) {
-                      error = "forbidden-sites file contains more than 1000 entries";
-                      return false;
-                  }
-                  replacement.insert(line);
-              }
-              {
-                  std::unique_lock lock(mutex_);
-                  entries_.swap(replacement);
-              }
-              return true;
-          }
-
-          bool AccessControlList::blocked(const std::string& host_or_ip) const {
-              std::string candidate = lower_copy(trim_copy(host_or_ip));
-              while (!candidate.empty() && candidate.back() == '.') {
-                  candidate.pop_back();
-              }
-              std::shared_lock lock(mutex_);
-              if (entries_.find(candidate) != entries_.end()) {
-                  return true;
-              }
-              in_addr ipv4{};
-              in6_addr ipv6{};
-              if (inet_pton(AF_INET, candidate.c_str(), &ipv4) == 1 ||
-                  inet_pton(AF_INET6, candidate.c_str(), &ipv6) == 1) {
-                  return false;
-              }
-              std::size_t dot = candidate.find('.');
-              while (dot != std::string::npos) {
-                  const std::string suffix = candidate.substr(dot + 1);
-                  if (entries_.find(suffix) != entries_.end()) {
-                      return true;
-                  }
-                  dot = candidate.find('.', dot + 1);
-              }
-              return false;
-          }
-
-          std::size_t AccessControlList::size() const {
-              std::shared_lock lock(mutex_);
-              return entries_.size();
-          }
-
-          } // namespace c2s
-          '''.replace("          ", ""), encoding="utf-8")
-
-          tests = Path("tests/integration.py")
-          replace_once(
-              tests,
-              '''def status(response: bytes) -> int:
-              return int(response.split(b"\\r\\n", 1)[0].split()[1])
-
-
-          def main() -> None:
-          ''',
-              '''def status(response: bytes) -> int:
-              return int(response.split(b"\\r\\n", 1)[0].split()[1])
-
-
-          def assert_startup_rejected(work: Path, *arguments: str) -> None:
-              completed = subprocess.run(
-                  [str(PROXY), *arguments],
-                  cwd=work,
-                  stdout=subprocess.PIPE,
-                  stderr=subprocess.PIPE,
-                  text=True,
-                  timeout=3,
-                  check=False,
-              )
-              assert completed.returncode == 2, completed
-
-
-          def main() -> None:
-          ''',
-          )
-          replace_once(
-              tests,
-              '''        access_log = work / "access.log"
-              env = os.environ.copy()
-          ''',
-              '''        access_log = work / "access.log"
-
-              assert_startup_rejected(
-                  work, "-p", str(proxy_port), "-a", "../forbidden.txt", "-l", access_log.name
-              )
-              assert_startup_rejected(
-                  work, "-p", str(proxy_port), "-a", acl.name, "-l", "nested/access.log"
-              )
-              acl_link = work / "forbidden-link.txt"
-              acl_link.symlink_to(acl.name)
-              assert_startup_rejected(
-                  work, "-p", str(proxy_port), "-a", acl_link.name, "-l", access_log.name
-              )
-              log_link = work / "access-link.log"
-              log_link.symlink_to(cert.name)
-              assert_startup_rejected(
-                  work, "-p", str(proxy_port), "-a", acl.name, "-l", log_link.name
-              )
-
-              env = os.environ.copy()
-          ''',
-          )
-          replace_once(
-              tests,
-              '[str(PROXY), "-p", str(proxy_port), "-a", str(acl), "-l", str(access_log)],',
-              '[str(PROXY), "-p", str(proxy_port), "-a", acl.name, "-l", access_log.name],',
-          )
-          replace_once(
-              tests,
-              '            assert " 501 " in log_text\n',
-              '            assert " 501 " in log_text\n            assert access_log.stat().st_mode & 0o777 == 0o600\n',
-          )
-
-          readme = Path("README.md")
-          replace_once(
-              readme,
-              '- RFC 3339 access logs with client, request line, status, and byte count\n',
-              '- RFC 3339 access logs with client, request line, status, and byte count\n'
-              '- ACL and log files confined to the working directory, with traversal and symlink rejection\n'
-              '- Regular-file enforcement, a 1 MiB ACL limit, and owner-only access-log permissions\n',
-          )
-          replace_once(
-              readme,
-              './bin/myproxy -p LISTEN_PORT -a FORBIDDEN_SITES_FILE -l ACCESS_LOG\n',
-              './bin/myproxy -p LISTEN_PORT -a FORBIDDEN_SITES_FILENAME -l ACCESS_LOG_FILENAME\n',
-          )
-          replace_once(
-              readme,
-              'Example:\n\n```sh\nprintf \'example.org\\n203.0.113.9\\n\' > forbidden.txt\n./bin/myproxy -p 9090 -a forbidden.txt -l access.log\ncurl -x http://127.0.0.1:9090 http://example.com/\n```\n',
-              'The ACL and log arguments must each be a single filename in the process working directory. Absolute paths, directory separators, parent-directory references, symbolic links, and non-regular files are rejected. To store runtime files elsewhere, change into that directory before launching the binary by its absolute path.\n\nExample:\n\n```sh\nmkdir -p runtime\nprintf \'example.org\\n203.0.113.9\\n\' > runtime/forbidden.txt\ncd runtime\n/path/to/Concurrent-C2S-Proxy/bin/myproxy -p 9090 -a forbidden.txt -l access.log\ncurl -x http://127.0.0.1:9090 http://example.com/\n```\n',
-          )
-          replace_once(
-              readme,
-              'The integration suite creates a local TLS origin and verifies GET, HEAD, `X-Forwarded-For`, unsupported methods, concurrency, ACL reload, forbidden responses, and access logging.\n',
-              'The integration suite creates a local TLS origin and verifies GET, HEAD, `X-Forwarded-For`, unsupported methods, concurrency, ACL reload, forbidden responses, access logging, path traversal rejection, symlink rejection, and restrictive log permissions.\n',
-          )
-
-          ci = Path(".github/workflows/ci.yml")
-          replace_once(ci, "  pull_request:\n", "  pull_request:\n  workflow_dispatch:\n")
-          PY
+          cat > /tmp/hardening.patch <<'PATCH'
+          diff -ruN a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+          --- a/.github/workflows/ci.yml	2026-07-20 01:54:36.000000000 +0000
+          +++ b/.github/workflows/ci.yml	2026-07-21 06:11:45.676336576 +0000
+          @@ -2,6 +2,7 @@
+           on:
+             push:
+             pull_request:
+          +  workflow_dispatch:
+           jobs:
+             build-and-test:
+               runs-on: ubuntu-latest
+          diff -ruN a/README.md b/README.md
+          --- a/README.md	2026-07-20 01:54:36.000000000 +0000
+          +++ b/README.md	2026-07-21 06:10:15.407321121 +0000
+          @@ -18,6 +18,8 @@
+           - Content-Length, chunked, HEAD, and close-delimited response relay
+           - Downstream keep-alive when message framing permits it
+           - RFC 3339 access logs with client, request line, status, and byte count
+          +- ACL and log files confined to the working directory, with traversal and symlink rejection
+          +- Regular-file enforcement, a 1 MiB ACL limit, and owner-only access-log permissions
+           
+           ## Dependencies
+           
+          @@ -40,14 +42,18 @@
+           ## Usage
+           
+           ```sh
+          -./bin/myproxy -p LISTEN_PORT -a FORBIDDEN_SITES_FILE -l ACCESS_LOG
+          +./bin/myproxy -p LISTEN_PORT -a FORBIDDEN_SITES_FILENAME -l ACCESS_LOG_FILENAME
+           ```
+           
+          +The ACL and log arguments must each be a single filename in the process working directory. Absolute paths, directory separators, parent-directory references, symbolic links, and non-regular files are rejected. To store runtime files elsewhere, change into that directory before launching the binary by its absolute path.
+          +
+           Example:
+           
+           ```sh
+          -printf 'example.org\n203.0.113.9\n' > forbidden.txt
+          -./bin/myproxy -p 9090 -a forbidden.txt -l access.log
+          +mkdir -p runtime
+          +printf 'example.org\n203.0.113.9\n' > runtime/forbidden.txt
+          +cd runtime
+          +/path/to/Concurrent-C2S-Proxy/bin/myproxy -p 9090 -a forbidden.txt -l access.log
+           curl -x http://127.0.0.1:9090 http://example.com/
+           ```
+           
+          @@ -61,7 +67,7 @@
+           make test
+           ```
+           
+          -The integration suite creates a local TLS origin and verifies GET, HEAD, `X-Forwarded-For`, unsupported methods, concurrency, ACL reload, forbidden responses, and access logging.
+          +The integration suite creates a local TLS origin and verifies GET, HEAD, `X-Forwarded-For`, unsupported methods, concurrency, ACL reload, forbidden responses, access logging, path traversal rejection, symlink rejection, and restrictive log permissions.
+           
+           For local development against a self-signed origin only, set `C2S_INSECURE=1`. Certificate verification remains enabled by default.
+           
+          diff -ruN a/src/acl.cpp b/src/acl.cpp
+          --- a/src/acl.cpp	2026-07-20 01:57:25.000000000 +0000
+          +++ b/src/acl.cpp	2026-07-21 06:10:15.389414440 +0000
+          @@ -2,18 +2,69 @@
+           #include "util.hpp"
+           
+           #include <arpa/inet.h>
+          -#include <fstream>
+          +#include <fcntl.h>
+          +#include <sys/stat.h>
+          +#include <unistd.h>
+          +
+          +#include <cerrno>
+          +#include <cstring>
+           #include <mutex>
+          +#include <sstream>
+           
+           namespace c2s {
+           
+           bool AccessControlList::load(const std::string& path, std::string& error) {
+          -    std::ifstream input(path);
+          -    if (!input) {
+          -        error = "cannot open forbidden-sites file: " + path;
+          +    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+          +    if (fd < 0) {
+          +        error = "cannot open forbidden-sites file: " + path + ": " + std::strerror(errno);
+               return false;
+           }
+          +
+          +    struct stat metadata{};
+          +    if (::fstat(fd, &metadata) != 0 || !S_ISREG(metadata.st_mode)) {
+          +        error = "forbidden-sites file must be a regular file: " + path;
+          +        ::close(fd);
+          +        return false;
+          +    }
+          +
+          +    constexpr std::size_t kMaximumAclBytes = 1024U * 1024U;
+          +    std::string contents;
+          +    if (metadata.st_size > 0) {
+          +        const auto size = static_cast<std::uintmax_t>(metadata.st_size);
+          +        if (size > kMaximumAclBytes) {
+          +            error = "forbidden-sites file exceeds 1 MiB";
+          +            ::close(fd);
+          +            return false;
+          +        }
+          +        contents.reserve(static_cast<std::size_t>(size));
+          +    }
+          +
+          +    char buffer[8192];
+          +    while (true) {
+          +        const ssize_t count = ::read(fd, buffer, sizeof(buffer));
+          +        if (count == 0) {
+          +            break;
+          +        }
+          +        if (count < 0) {
+          +            if (errno == EINTR) {
+          +                continue;
+          +            }
+          +            error = "cannot read forbidden-sites file: " + path + ": " + std::strerror(errno);
+          +            ::close(fd);
+          +            return false;
+          +        }
+          +        const auto amount = static_cast<std::size_t>(count);
+          +        if (contents.size() > kMaximumAclBytes - amount) {
+          +            error = "forbidden-sites file exceeds 1 MiB";
+          +            ::close(fd);
+          +            return false;
+          +        }
+          +        contents.append(buffer, amount);
+          +    }
+          +    ::close(fd);
+          +
+               std::unordered_set<std::string> replacement;
+          +    std::istringstream input(contents);
+               std::string line;
+               while (std::getline(input, line)) {
+                   const auto comment = line.find('#');
+          diff -ruN a/src/proxy.cpp b/src/proxy.cpp
+          --- a/src/proxy.cpp	2026-07-20 01:59:38.000000000 +0000
+          +++ b/src/proxy.cpp	2026-07-21 06:10:15.378577293 +0000
+          @@ -8,6 +8,7 @@
+           #include <poll.h>
+           #include <signal.h>
+           #include <sys/socket.h>
+          +#include <sys/stat.h>
+           #include <unistd.h>
+           
+           #include <algorithm>
+          @@ -18,7 +19,6 @@
+           #include <cstdlib>
+           #include <cstring>
+           #include <fcntl.h>
+          -#include <fstream>
+           #include <iostream>
+           #include <map>
+           #include <memory>
+          @@ -97,14 +97,43 @@
+               std::uint64_t next_id_{1};
+           };
+           
+          +bool write_all_file(int fd, const char* data, std::size_t size) {
+          +    std::size_t offset = 0;
+          +    while (offset < size) {
+          +        const ssize_t count = ::write(fd, data + offset, size - offset);
+          +        if (count < 0) {
+          +            if (errno == EINTR) {
+          +                continue;
+          +            }
+          +            return false;
+          +        }
+          +        offset += static_cast<std::size_t>(count);
+          +    }
+          +    return true;
+          +}
+          +
+           class AccessLogger {
+           public:
+               explicit AccessLogger(std::string path) : path_(std::move(path)) {}
+          +    ~AccessLogger() {
+          +        if (fd_ >= 0) {
+          +            ::close(fd_);
+          +        }
+          +    }
+          +    AccessLogger(const AccessLogger&) = delete;
+          +    AccessLogger& operator=(const AccessLogger&) = delete;
+           
+               bool verify(std::string& error) {
+          -        std::ofstream output(path_, std::ios::app);
+          -        if (!output) {
+          -            error = "cannot open access log: " + path_;
+          +        fd_ = ::open(path_.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+          +        if (fd_ < 0) {
+          +            error = "cannot open access log: " + path_ + ": " + std::strerror(errno);
+          +            return false;
+          +        }
+          +        struct stat metadata{};
+          +        if (::fstat(fd_, &metadata) != 0 || !S_ISREG(metadata.st_mode)) {
+          +            error = "access log must be a regular file: " + path_;
+          +            ::close(fd_);
+          +            fd_ = -1;
+                       return false;
+                   }
+                   return true;
+          @@ -112,18 +141,19 @@
+           
+               void write(const std::string& client_ip, const std::string& request_line,
+                          int status, std::size_t response_size) {
+          +        std::ostringstream line;
+          +        line << c2s::rfc3339_now() << ' ' << client_ip << " \"" << request_line
+          +             << "\" " << status << ' ' << response_size << '\n';
+          +        const std::string entry = line.str();
+                   std::lock_guard lock(mutex_);
+          -        std::ofstream output(path_, std::ios::app);
+          -        if (!output) {
+          +        if (fd_ < 0 || !write_all_file(fd_, entry.data(), entry.size())) {
+                       std::cerr << "Cannot append to access log " << path_ << '\n';
+          -            return;
+                   }
+          -        output << c2s::rfc3339_now() << ' ' << client_ip << " \"" << request_line
+          -               << "\" " << status << ' ' << response_size << '\n';
+               }
+           
+           private:
+               std::string path_;
+          +    int fd_{-1};
+               std::mutex mutex_;
+           };
+           
+          @@ -145,13 +175,26 @@
+               }
+               for (int index = 1; index < argc; index += 2) {
+                   const std::string option = argv[index];
+          -        const std::string value = argv[index + 1];
+          +        const char* raw_value = argv[index + 1];
+          +        if (raw_value == nullptr || *raw_value == '\0') {
+          +            return false;
+          +        }
+                   if (option == "-p") {
+          -            port = value;
+          +            port = raw_value;
+                   } else if (option == "-a") {
+          -            acl_path = value;
+          +            if (std::strstr(raw_value, "..") != nullptr ||
+          +                std::strchr(raw_value, '/') != nullptr ||
+          +                std::strchr(raw_value, '\\') != nullptr) {
+          +                return false;
+          +            }
+          +            acl_path = raw_value;
+                   } else if (option == "-l") {
+          -            log_path = value;
+          +            if (std::strstr(raw_value, "..") != nullptr ||
+          +                std::strchr(raw_value, '/') != nullptr ||
+          +                std::strchr(raw_value, '\\') != nullptr) {
+          +                return false;
+          +            }
+          +            log_path = raw_value;
+                   } else {
+                       return false;
+                   }
+          @@ -607,7 +650,8 @@
+               std::string acl_path;
+               std::string log_path;
+               if (!parse_arguments(argc, argv, port, acl_path, log_path)) {
+          -        std::cerr << "Usage: myproxy -p listen_port -a forbidden_sites_file_path -l access_log_file_path\n";
+          +        std::cerr << "Usage: myproxy -p listen_port -a forbidden_sites_filename -l access_log_filename\n"
+          +                  << "ACL and log names must be single files in the current working directory.\n";
+                   return 2;
+               }
+           
+          diff -ruN a/tests/integration.py b/tests/integration.py
+          --- a/tests/integration.py	2026-07-20 02:00:32.000000000 +0000
+          +++ b/tests/integration.py	2026-07-21 06:10:15.399053999 +0000
+          @@ -109,6 +109,19 @@
+               return int(response.split(b"\r\n", 1)[0].split()[1])
+           
+           
+          +def assert_startup_rejected(work: Path, *arguments: str) -> None:
+          +    completed = subprocess.run(
+          +        [str(PROXY), *arguments],
+          +        cwd=work,
+          +        stdout=subprocess.PIPE,
+          +        stderr=subprocess.PIPE,
+          +        text=True,
+          +        timeout=3,
+          +        check=False,
+          +    )
+          +    assert completed.returncode == 2, completed
+          +
+          +
+           def main() -> None:
+               with tempfile.TemporaryDirectory(prefix="c2s-proxy-") as temporary:
+                   work = Path(temporary)
+          @@ -133,10 +146,28 @@
+                   acl = work / "forbidden.txt"
+                   acl.write_text("# initially empty\n", encoding="utf-8")
+                   access_log = work / "access.log"
+          +
+          +        assert_startup_rejected(
+          +            work, "-p", str(proxy_port), "-a", "../forbidden.txt", "-l", access_log.name
+          +        )
+          +        assert_startup_rejected(
+          +            work, "-p", str(proxy_port), "-a", acl.name, "-l", "nested/access.log"
+          +        )
+          +        acl_link = work / "forbidden-link.txt"
+          +        acl_link.symlink_to(acl.name)
+          +        assert_startup_rejected(
+          +            work, "-p", str(proxy_port), "-a", acl_link.name, "-l", access_log.name
+          +        )
+          +        log_link = work / "access-link.log"
+          +        log_link.symlink_to(cert.name)
+          +        assert_startup_rejected(
+          +            work, "-p", str(proxy_port), "-a", acl.name, "-l", log_link.name
+          +        )
+          +
+                   env = os.environ.copy()
+                   env["SSL_CERT_FILE"] = str(cert)
+                   proxy = subprocess.Popen(
+          -            [str(PROXY), "-p", str(proxy_port), "-a", str(acl), "-l", str(access_log)],
+          +            [str(PROXY), "-p", str(proxy_port), "-a", acl.name, "-l", access_log.name],
+                       cwd=work, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                   )
+                   try:
+          @@ -186,6 +217,7 @@
+                       assert " 200 " in log_text
+                       assert " 403 " in log_text
+                       assert " 501 " in log_text
+          +            assert access_log.stat().st_mode & 0o777 == 0o600
+                       print("integration tests passed")
+                   finally:
+                       proxy.terminate()
+          PATCH
+          patch -p1 < /tmp/hardening.patch
+          git diff --check
 
       - name: Build and test
         run: make clean && make test
@@ -443,10 +361,9 @@ jobs:
       - name: Commit hardened implementation
         shell: bash
         run: |
-          rm .github/workflows/apply-path-hardening.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/proxy.cpp src/acl.cpp tests/integration.py README.md .github/workflows/ci.yml .github/workflows/apply-path-hardening.yml
+          git add src/proxy.cpp src/acl.cpp tests/integration.py README.md .github/workflows/ci.yml
           git commit -m "Harden ACL and log path handling"
           git push origin HEAD:main
 
