@@ -18,6 +18,8 @@ This project was originally completed for **CSE 156/L: Network Programming** at 
 - Content-Length, chunked, HEAD, and close-delimited response relay
 - Downstream keep-alive when message framing permits it
 - RFC 3339 access logs with client, request line, status, and byte count
+- ACL and log files confined to the working directory, with traversal and symlink rejection
+- Regular-file enforcement, a 1 MiB ACL limit, and owner-only access-log permissions
 
 ## Dependencies
 
@@ -40,14 +42,18 @@ make
 ## Usage
 
 ```sh
-./bin/myproxy -p LISTEN_PORT -a FORBIDDEN_SITES_FILE -l ACCESS_LOG
+./bin/myproxy -p LISTEN_PORT -a FORBIDDEN_SITES_FILENAME -l ACCESS_LOG_FILENAME
 ```
+
+The ACL and log arguments must each be a single filename in the process working directory. Absolute paths, directory separators, parent-directory references, symbolic links, and non-regular files are rejected. To store runtime files elsewhere, change into that directory before launching the binary by its absolute path.
 
 Example:
 
 ```sh
-printf 'example.org\n203.0.113.9\n' > forbidden.txt
-./bin/myproxy -p 9090 -a forbidden.txt -l access.log
+mkdir -p runtime
+printf 'example.org\n203.0.113.9\n' > runtime/forbidden.txt
+cd runtime
+/path/to/Concurrent-C2S-Proxy/bin/myproxy -p 9090 -a forbidden.txt -l access.log
 curl -x http://127.0.0.1:9090 http://example.com/
 ```
 
@@ -61,7 +67,7 @@ Send `Control-C` (`SIGINT`) to reload the forbidden-sites file. The process rema
 make test
 ```
 
-The integration suite creates a local TLS origin and verifies GET, HEAD, `X-Forwarded-For`, unsupported methods, concurrency, ACL reload, forbidden responses, and access logging.
+The integration suite creates a local TLS origin and verifies GET, HEAD, `X-Forwarded-For`, unsupported methods, concurrency, ACL reload, forbidden responses, access logging, path traversal rejection, symlink rejection, and restrictive log permissions.
 
 For local development against a self-signed origin only, set `C2S_INSECURE=1`. Certificate verification remains enabled by default.
 

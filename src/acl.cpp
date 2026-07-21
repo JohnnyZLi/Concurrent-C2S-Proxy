@@ -2,18 +2,69 @@
 #include "util.hpp"
 
 #include <arpa/inet.h>
-#include <fstream>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <cstring>
 #include <mutex>
+#include <sstream>
 
 namespace c2s {
 
 bool AccessControlList::load(const std::string& path, std::string& error) {
-    std::ifstream input(path);
-    if (!input) {
-        error = "cannot open forbidden-sites file: " + path;
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) {
+        error = "cannot open forbidden-sites file: " + path + ": " + std::strerror(errno);
         return false;
     }
+
+    struct stat metadata{};
+    if (::fstat(fd, &metadata) != 0 || !S_ISREG(metadata.st_mode)) {
+        error = "forbidden-sites file must be a regular file: " + path;
+        ::close(fd);
+        return false;
+    }
+
+    constexpr std::size_t kMaximumAclBytes = 1024U * 1024U;
+    std::string contents;
+    if (metadata.st_size > 0) {
+        const auto size = static_cast<std::uintmax_t>(metadata.st_size);
+        if (size > kMaximumAclBytes) {
+            error = "forbidden-sites file exceeds 1 MiB";
+            ::close(fd);
+            return false;
+        }
+        contents.reserve(static_cast<std::size_t>(size));
+    }
+
+    char buffer[8192];
+    while (true) {
+        const ssize_t count = ::read(fd, buffer, sizeof(buffer));
+        if (count == 0) {
+            break;
+        }
+        if (count < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            error = "cannot read forbidden-sites file: " + path + ": " + std::strerror(errno);
+            ::close(fd);
+            return false;
+        }
+        const auto amount = static_cast<std::size_t>(count);
+        if (contents.size() > kMaximumAclBytes - amount) {
+            error = "forbidden-sites file exceeds 1 MiB";
+            ::close(fd);
+            return false;
+        }
+        contents.append(buffer, amount);
+    }
+    ::close(fd);
+
     std::unordered_set<std::string> replacement;
+    std::istringstream input(contents);
     std::string line;
     while (std::getline(input, line)) {
         const auto comment = line.find('#');
