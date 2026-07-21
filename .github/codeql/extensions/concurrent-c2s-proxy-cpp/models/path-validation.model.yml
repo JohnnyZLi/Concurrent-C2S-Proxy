@@ -1,0 +1,7 @@
+extensions:
+  - addsTo:
+      pack: codeql/cpp-all
+      extensible: barrierModel
+    data:
+      - ["", "", false, "parse_arguments", "", "", "Argument[3]", "path-injection", "manual"]
+      - ["", "", false, "parse_arguments", "", "", "Argument[4]", "path-injection", "manual"]
