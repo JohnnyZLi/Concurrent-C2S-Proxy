@@ -1,0 +1,7 @@
+name: johnnyzli/concurrent-c2s-proxy-cpp-models
+version: 0.0.1
+library: true
+extensionTargets:
+  codeql/cpp-all: "*"
+dataExtensions:
+  - models/**/*.yml
