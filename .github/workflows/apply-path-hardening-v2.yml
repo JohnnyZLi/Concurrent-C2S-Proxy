@@ -1,9 +1,8 @@
 name: Apply corrected path hardening
 
 on:
-  push:
-    paths:
-      - .github/workflows/apply-path-hardening-v2.yml
+  issues:
+    types: [opened]
   workflow_dispatch:
 
 permissions:
@@ -12,12 +11,14 @@ permissions:
 
 jobs:
   apply:
+    if: github.event_name != 'issues' || github.event.issue.title == 'Apply tested path hardening'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - name: Check out repository
+      - name: Check out main
         uses: actions/checkout@v6
         with:
+          ref: main
           fetch-depth: 0
 
       - name: Install build dependencies
