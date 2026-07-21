@@ -1,0 +1,89 @@
+name: Apply CodeQL sink fix
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  apply:
+    if: github.event.issue.title == 'Apply CodeQL sink validation fix'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libssl-dev
+
+      - name: Add validation directly at filesystem sinks
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          proxy = Path('src/proxy.cpp')
+          text = proxy.read_text(encoding='utf-8')
+          old = '''    bool verify(std::string& error) {
+              fd_ = ::open(path_.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+          '''
+          new = '''    bool verify(std::string& error) {
+              const char* file_name = path_.c_str();
+              if (std::strstr(file_name, "..") != nullptr ||
+                  std::strchr(file_name, '/') != nullptr ||
+                  std::strchr(file_name, '\\\\') != nullptr) {
+                  error = "access log must be a single filename in the working directory";
+                  return false;
+              }
+              fd_ = ::open(file_name, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f'proxy replacement count: {text.count(old)}')
+          proxy.write_text(text.replace(old, new), encoding='utf-8')
+
+          acl = Path('src/acl.cpp')
+          text = acl.read_text(encoding='utf-8')
+          old = '''bool AccessControlList::load(const std::string& path, std::string& error) {
+              const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+          '''
+          new = '''bool AccessControlList::load(const std::string& path, std::string& error) {
+              const char* file_name = path.c_str();
+              if (std::strstr(file_name, "..") != nullptr ||
+                  std::strchr(file_name, '/') != nullptr ||
+                  std::strchr(file_name, '\\\\') != nullptr) {
+                  error = "forbidden-sites file must be a single filename in the working directory";
+                  return false;
+              }
+              const int fd = ::open(file_name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f'acl replacement count: {text.count(old)}')
+          acl.write_text(text.replace(old, new), encoding='utf-8')
+          PY
+          git diff --check
+
+      - name: Build and test
+        run: make clean && make test
+
+      - name: Commit fix
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/proxy.cpp src/acl.cpp
+          git commit -m "Validate filenames at filesystem sinks"
+          git push origin HEAD:main
+
+      - name: Close trigger issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue comment "${{ github.event.issue.number }}" --body "Applied and tested the CodeQL sink-validation fix."
+          gh issue close "${{ github.event.issue.number }}" --reason completed
