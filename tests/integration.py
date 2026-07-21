@@ -109,6 +109,19 @@ def status(response: bytes) -> int:
     return int(response.split(b"\r\n", 1)[0].split()[1])
 
 
+def assert_startup_rejected(work: Path, *arguments: str) -> None:
+    completed = subprocess.run(
+        [str(PROXY), *arguments],
+        cwd=work,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=3,
+        check=False,
+    )
+    assert completed.returncode == 2, completed
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="c2s-proxy-") as temporary:
         work = Path(temporary)
@@ -133,10 +146,28 @@ def main() -> None:
         acl = work / "forbidden.txt"
         acl.write_text("# initially empty\n", encoding="utf-8")
         access_log = work / "access.log"
+
+        assert_startup_rejected(
+            work, "-p", str(proxy_port), "-a", "../forbidden.txt", "-l", access_log.name
+        )
+        assert_startup_rejected(
+            work, "-p", str(proxy_port), "-a", acl.name, "-l", "nested/access.log"
+        )
+        acl_link = work / "forbidden-link.txt"
+        acl_link.symlink_to(acl.name)
+        assert_startup_rejected(
+            work, "-p", str(proxy_port), "-a", acl_link.name, "-l", access_log.name
+        )
+        log_link = work / "access-link.log"
+        log_link.symlink_to(cert.name)
+        assert_startup_rejected(
+            work, "-p", str(proxy_port), "-a", acl.name, "-l", log_link.name
+        )
+
         env = os.environ.copy()
         env["SSL_CERT_FILE"] = str(cert)
         proxy = subprocess.Popen(
-            [str(PROXY), "-p", str(proxy_port), "-a", str(acl), "-l", str(access_log)],
+            [str(PROXY), "-p", str(proxy_port), "-a", acl.name, "-l", access_log.name],
             cwd=work, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         try:
@@ -186,6 +217,7 @@ def main() -> None:
             assert " 200 " in log_text
             assert " 403 " in log_text
             assert " 501 " in log_text
+            assert access_log.stat().st_mode & 0o777 == 0o600
             print("integration tests passed")
         finally:
             proxy.terminate()
